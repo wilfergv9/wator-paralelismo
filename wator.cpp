@@ -1,10 +1,32 @@
 /*
- * Compilar: g++ -O2 -std=c++17 -o wator wator.cpp
- * Ejecutar:  ./wator
+ * Wa-Tor Simulation — Paralelizado con OpenMP
+ * ============================================
+ * Estrategia: Coloreo de tablero (checkerboard / 4-coloring)
+ *
+ *   Las celdas se dividen en 4 grupos según (r%2, c%2):
+ *     Grupo 0: (par,   par  )
+ *     Grupo 1: (par,   impar)
+ *     Grupo 2: (impar, par  )
+ *     Grupo 3: (impar, impar)
+ *
+ *   Ninguna celda de un grupo es vecina Von Neumann de otra del mismo grupo,
+ *   por lo que las celdas dentro de un grupo son INDEPENDIENTES entre sí
+ *   y se pueden procesar en paralelo sin race conditions.
+ *   Los 4 grupos se procesan secuencialmente uno tras otro.
+ *
+ *   Otros puntos paralelos:
+ *     - Recolección de entidades por filas (#pragma omp parallel for)
+ *     - Conteo con reduction(+:p) reduction(+:s)
+ *     - Cada hilo tiene su propio mt19937 (thread_local) para el RNG
+ *
+ * Compilar: g++ -O2 -std=c++17 -fopenmp -o wator wator.cpp
+ * Ejecutar: ./wator
+ *           OMP_NUM_THREADS=8 ./wator   (para fijar número de hilos)
  */
 
 #include <iostream>
 #include <vector>
+#include <array>
 #include <algorithm>
 #include <random>
 #include <chrono>
@@ -12,20 +34,23 @@
 #include <fstream>
 #include <iomanip>
 #include <thread>
+#include <atomic>
+#include <omp.h>
 
 // ─── Parámetros de simulación ────────────────────────────────────────────────
 struct Config {
-    int  N           = 50;    // filas
-    int  M           = 50;    // columnas
-    int  n_peces     = 200;   // peces iniciales
-    int  n_tiburones = 50;    // tiburones iniciales
-    int  fish_breed  = 4;     // pasos para reproducir pez
-    int  shark_breed = 8;     // pasos para reproducir tiburón
-    int  starve_time = 5;     // energía inicial del tiburón
-    int  T           = 500;   // pasos de tiempo
-    bool visualizar  = true;  // mostrar grilla en terminal
-    int  delay_ms    = 80;    // ms entre frames
-    bool guardar_csv = true;  // exportar poblaciones a CSV
+    int  N           = 50;
+    int  M           = 50;
+    int  n_peces     = 200;
+    int  n_tiburones = 50;
+    int  fish_breed  = 4;
+    int  shark_breed = 8;
+    int  starve_time = 5;
+    int  T           = 500;
+    bool visualizar  = true;
+    int  delay_ms    = 80;
+    bool guardar_csv = true;
+    int  n_hilos     = 0;    // 0 = dejar que OpenMP decida
 };
 
 // ─── Constantes de celda ─────────────────────────────────────────────────────
@@ -35,200 +60,246 @@ constexpr int TIBURON = 2;
 
 // ─── Estructura de entidad ───────────────────────────────────────────────────
 struct Entidad {
-    int tipo;    // VACIO / PEZ / TIBURON
-    int edad;    // pasos desde última reproducción
-    int energia; // solo tiburones
+    int tipo;
+    int edad;
+    int energia;
 };
 
-// ─── RNG global ──────────────────────────────────────────────────────────────
-std::mt19937 rng(std::chrono::steady_clock::now().time_since_epoch().count());
+// ─── RNG por hilo (thread_local) ─────────────────────────────────────────────
+// Cada hilo OpenMP tiene su propio generador, inicializado con una semilla
+// distinta para evitar correlaciones entre hilos.
+thread_local std::mt19937 tl_rng;
+
+void inicializar_rngs() {
+    // Se llama dentro de una región paralela para que cada hilo inicialice el suyo
+    #pragma omp parallel
+    {
+        auto seed = std::chrono::steady_clock::now().time_since_epoch().count()
+                    ^ (static_cast<uint64_t>(omp_get_thread_num()) * 6364136223846793005ULL);
+        tl_rng.seed(seed);
+    }
+}
 
 template<typename T>
 T& elegir_al_azar(std::vector<T>& v) {
     std::uniform_int_distribution<int> d(0, (int)v.size() - 1);
-    return v[d(rng)];
+    return v[d(tl_rng)];
 }
 
 // ─── Grilla ──────────────────────────────────────────────────────────────────
 class Grilla {
 public:
     int N, M;
-    std::vector<std::vector<int>>     tipo;
-    std::vector<std::vector<Entidad>> ent;
+    // Almacenamiento plano (row-major) para mejor localidad de caché
+    std::vector<int>     tipo;
+    std::vector<Entidad> ent;
 
     Grilla(int N, int M)
         : N(N), M(M),
-          tipo(N, std::vector<int>(M, VACIO)),
-          ent (N, std::vector<Entidad>(M, {VACIO, 0, 0})) {}
+          tipo(N * M, VACIO),
+          ent (N * M, {VACIO, 0, 0}) {}
 
-    // Vecindad Von Neumann toroidal
-    std::vector<std::pair<int,int>> vecinas(int r, int c) const {
+    inline int idx(int r, int c) const { return r * M + c; }
+
+    // Vecindad Von Neumann toroidal — devuelve índices planos
+    std::array<int,4> vecinas(int r, int c) const {
         return {
-            {(r-1+N)%N, c},
-            {(r+1)%N,   c},
-            {r, (c-1+M)%M},
-            {r, (c+1)%M}
+            ((r-1+N)%N) * M + c,
+            ((r+1)%N)   * M + c,
+            r * M + (c-1+M)%M,
+            r * M + (c+1)%M
         };
     }
 
-    std::vector<std::pair<int,int>> vecinas_de_tipo(int r, int c, int t) const {
-        auto v = vecinas(r, c);
-        std::vector<std::pair<int,int>> res;
+    // Vecinas de un tipo concreto (devuelve índices planos)
+    std::vector<int> vecinas_de_tipo(int r, int c, int t) const {
+        std::vector<int> res;
         res.reserve(4);
-        for (auto [nr, nc] : v)
-            if (tipo[nr][nc] == t) res.push_back({nr, nc});
+        for (int i : vecinas(r, c))
+            if (tipo[i] == t) res.push_back(i);
         return res;
     }
 
-    void limpiar(int r, int c) {
-        tipo[r][c] = VACIO;
-        ent [r][c] = {VACIO, 0, 0};
+    void limpiar(int i) {
+        tipo[i] = VACIO;
+        ent [i] = {VACIO, 0, 0};
     }
 
-    void colocar(int r, int c, int t, int edad, int energia) {
-        tipo[r][c]         = t;
-        ent [r][c].tipo    = t;
-        ent [r][c].edad    = edad;
-        ent [r][c].energia = energia;
+    void colocar(int i, int t, int edad, int energia) {
+        tipo[i]         = t;
+        ent [i].tipo    = t;
+        ent [i].edad    = edad;
+        ent [i].energia = energia;
     }
 };
 
-// ─── Inicialización aleatoria ─────────────────────────────────────────────────
+// ─── Inicialización ───────────────────────────────────────────────────────────
 void inicializar(Grilla& g, const Config& cfg) {
-    std::vector<std::pair<int,int>> celdas;
-    celdas.reserve(g.N * g.M);
-    for (int r = 0; r < g.N; r++)
-        for (int c = 0; c < g.M; c++)
-            celdas.push_back({r, c});
+    // Secuencial: solo ocurre una vez
+    std::mt19937 rng(std::chrono::steady_clock::now().time_since_epoch().count());
+    std::vector<int> celdas(g.N * g.M);
+    std::iota(celdas.begin(), celdas.end(), 0);
     std::shuffle(celdas.begin(), celdas.end(), rng);
 
     int idx = 0;
-    for (int i = 0; i < cfg.n_peces && idx < (int)celdas.size(); i++, idx++) {
-        auto [r, c] = celdas[idx];
-        g.colocar(r, c, PEZ, 0, 0);
-    }
-    for (int i = 0; i < cfg.n_tiburones && idx < (int)celdas.size(); i++, idx++) {
-        auto [r, c] = celdas[idx];
-        g.colocar(r, c, TIBURON, 0, cfg.starve_time);
-    }
+    for (int i = 0; i < cfg.n_peces && idx < (int)celdas.size(); i++, idx++)
+        g.colocar(celdas[idx], PEZ, 0, 0);
+    for (int i = 0; i < cfg.n_tiburones && idx < (int)celdas.size(); i++, idx++)
+        g.colocar(celdas[idx], TIBURON, 0, cfg.starve_time);
 }
+
 
 void paso(Grilla& g, const Config& cfg) {
 
+    const int NM = g.N * g.M;
+
     // ── Fase peces ────────────────────────────────────────────────────────────
-    {
-        std::vector<std::pair<int,int>> peces;
-        peces.reserve(g.N * g.M / 4);
-        for (int r = 0; r < g.N; r++)
-            for (int c = 0; c < g.M; c++)
-                if (g.tipo[r][c] == PEZ) peces.push_back({r, c});
-        std::shuffle(peces.begin(), peces.end(), rng);
+    for (int color = 0; color < 4; color++) {
+        int dr = color >> 1;   // 0 o 1
+        int dc = color &  1;   // 0 o 1
 
-        // Evitar procesar dos veces un pez que se mueve a una celda no visitada
-        std::vector<std::vector<bool>> ya_movido(g.N, std::vector<bool>(g.M, false));
+        // Recolectar peces de este color en paralelo por filas
+        // Cada hilo llena su propio buffer local, luego se concatenan
+        std::vector<std::vector<int>> bufs(omp_get_max_threads());
 
-        for (auto [r, c] : peces) {
-            if (ya_movido[r][c])     continue; // llegó aquí este paso
-            if (g.tipo[r][c] != PEZ) continue; // fue comido por un tiburón previo
+        #pragma omp parallel
+        {
+            int tid = omp_get_thread_num();
+            auto& buf = bufs[tid];
+
+            #pragma omp for schedule(static) nowait
+            for (int r = dr; r < g.N; r += 2) {
+                for (int c = dc; c < g.M; c += 2) {
+                    int i = g.idx(r, c);
+                    if (g.tipo[i] == PEZ) buf.push_back(i);
+                }
+            }
+        }
+
+        // Concatenar buffers
+        std::vector<int> peces;
+        for (auto& b : bufs) {
+            peces.insert(peces.end(), b.begin(), b.end());
+            b.clear();
+        }
+
+        // Mezclar (secuencial — shuffle paralelo no preserva uniformidad fácilmente)
+        std::shuffle(peces.begin(), peces.end(), tl_rng);
+
+        // Procesar en paralelo — sin race conditions por el coloring
+        #pragma omp parallel for schedule(dynamic, 64)
+        for (int k = 0; k < (int)peces.size(); k++) {
+            int i = peces[k];
+            int r = i / g.M;
+            int c = i % g.M;
+
+            if (g.tipo[i] != PEZ) continue; // fue sobreescrito (raro en mismo color)
 
             auto vacias = g.vecinas_de_tipo(r, c, VACIO);
-
-            // Si no hay vecinas vacías: no se mueve, edad no cambia
             if (vacias.empty()) continue;
 
-            auto [nr, nc] = elegir_al_azar(vacias);
-
-            // Incrementar edad ANTES de decidir reproducción
-            int nueva_edad = g.ent[r][c].edad + 1;
+            int dest      = elegir_al_azar(vacias);
+            int nueva_edad = g.ent[i].edad + 1;
             bool reproduce = (nueva_edad >= cfg.fish_breed);
 
-            // Mover pez al destino
-            g.colocar(nr, nc, PEZ, reproduce ? 0 : nueva_edad, 0);
-            ya_movido[nr][nc] = true;
+            g.colocar(dest, PEZ, reproduce ? 0 : nueva_edad, 0);
 
-            // Origen: cría (edad 0) o vacío
             if (reproduce)
-                g.colocar(r, c, PEZ, 0, 0);
+                g.colocar(i, PEZ, 0, 0);
             else
-                g.limpiar(r, c);
+                g.limpiar(i);
         }
-    }
+    } // for color (peces)
 
     // ── Fase tiburones ────────────────────────────────────────────────────────
-    {
-        std::vector<std::pair<int,int>> tiburones;
-        tiburones.reserve(g.N * g.M / 8);
-        for (int r = 0; r < g.N; r++)
-            for (int c = 0; c < g.M; c++)
-                if (g.tipo[r][c] == TIBURON) tiburones.push_back({r, c});
-        std::shuffle(tiburones.begin(), tiburones.end(), rng);
+    for (int color = 0; color < 4; color++) {
+        int dr = color >> 1;
+        int dc = color &  1;
 
-        std::vector<std::vector<bool>> ya_movido(g.N, std::vector<bool>(g.M, false));
+        std::vector<std::vector<int>> bufs(omp_get_max_threads());
 
-        for (auto [r, c] : tiburones) {
-            if (ya_movido[r][c])          continue;
-            if (g.tipo[r][c] != TIBURON)  continue;
+        #pragma omp parallel
+        {
+            int tid = omp_get_thread_num();
+            auto& buf = bufs[tid];
 
-            int edad    = g.ent[r][c].edad;
-            int energia = g.ent[r][c].energia;
-            int nr = r, nc = c;
+            #pragma omp for schedule(static) nowait
+            for (int r = dr; r < g.N; r += 2) {
+                for (int c = dc; c < g.M; c += 2) {
+                    int i = g.idx(r, c);
+                    if (g.tipo[i] == TIBURON) buf.push_back(i);
+                }
+            }
+        }
+
+        std::vector<int> tiburones;
+        for (auto& b : bufs) {
+            tiburones.insert(tiburones.end(), b.begin(), b.end());
+            b.clear();
+        }
+
+        std::shuffle(tiburones.begin(), tiburones.end(), tl_rng);
+
+        #pragma omp parallel for schedule(dynamic, 64)
+        for (int k = 0; k < (int)tiburones.size(); k++) {
+            int i = tiburones[k];
+            int r = i / g.M;
+            int c = i % g.M;
+
+            if (g.tipo[i] != TIBURON) continue;
+
+            int edad    = g.ent[i].edad;
+            int energia = g.ent[i].energia;
+            int dest    = i;
 
             auto con_pez = g.vecinas_de_tipo(r, c, PEZ);
 
             if (!con_pez.empty()) {
-                // Comer: moverse a celda del pez, restaurar energía
-                auto [pr, pc] = elegir_al_azar(con_pez);
-                nr = pr; nc = pc;
-                energia = cfg.starve_time;   // energía se reinicia al comer
+                dest    = elegir_al_azar(con_pez);
+                energia = cfg.starve_time;          // reiniciar al comer
             } else {
-                // No hay peces: intentar moverse a vacío
                 auto vacias = g.vecinas_de_tipo(r, c, VACIO);
-                if (!vacias.empty()) {
-                    auto [vr, vc] = elegir_al_azar(vacias);
-                    nr = vr; nc = vc;
-                }
-                energia -= 1;  // pierde energía SOLO si no comió
+                if (!vacias.empty())
+                    dest = elegir_al_azar(vacias);
+                energia -= 1;                       // pierde energía solo si no comió
             }
 
-            // Incrementar edad (siempre)
             edad += 1;
 
-            // Morir por hambre (ANTES de reproducirse)
+            // Morir por hambre
             if (energia <= 0) {
-                g.limpiar(r, c);
+                g.limpiar(i);
                 continue;
             }
 
-            // Reproducción
             bool reproduce = (edad >= cfg.shark_breed);
 
-            if (nr == r && nc == c) {
+            if (dest == i) {
                 // No se pudo mover
-                g.colocar(r, c, TIBURON, reproduce ? 0 : edad, energia);
+                g.colocar(i, TIBURON, reproduce ? 0 : edad, energia);
                 continue;
             }
 
-            // Mover tiburón al destino
-            g.colocar(nr, nc, TIBURON, reproduce ? 0 : edad, energia);
-            ya_movido[nr][nc] = true;
+            g.colocar(dest, TIBURON, reproduce ? 0 : edad, energia);
 
-            // Origen: cría o vacío
             if (reproduce)
-                g.colocar(r, c, TIBURON, 0, cfg.starve_time);
+                g.colocar(i, TIBURON, 0, cfg.starve_time);
             else
-                g.limpiar(r, c);
+                g.limpiar(i);
         }
-    }
+    } // for color (tiburones)
 }
 
-// ─── Contadores ───────────────────────────────────────────────────────────────
+// ─── Conteo paralelo con reduction ───────────────────────────────────────────
 std::pair<int,int> contar(const Grilla& g) {
     int p = 0, s = 0;
-    for (int r = 0; r < g.N; r++)
-        for (int c = 0; c < g.M; c++) {
-            if (g.tipo[r][c] == PEZ)     p++;
-            if (g.tipo[r][c] == TIBURON) s++;
-        }
+    const int NM = g.N * g.M;
+
+    #pragma omp parallel for reduction(+:p) reduction(+:s) schedule(static)
+    for (int i = 0; i < NM; i++) {
+        if (g.tipo[i] == PEZ)     p++;
+        if (g.tipo[i] == TIBURON) s++;
+    }
     return {p, s};
 }
 
@@ -269,23 +340,23 @@ void grafico_ascii(const std::vector<int>& hp, const std::vector<int>& hs) {
 }
 
 void visualizar(const Grilla& g, int t, int peces, int tiburones,
-                const std::vector<int>& hp, const std::vector<int>& hs) {
+                const std::vector<int>& hp, const std::vector<int>& hs,
+                int n_hilos) {
     limpiar_pantalla();
-
-    std::cout << "\033[1;37m╔══════════════════════════════════════╗\033[0m\n";
-    std::cout << "\033[1;37m║        🌊  WA-TOR SIMULATION         ║\033[0m\n";
-    std::cout << "\033[1;37m╚══════════════════════════════════════╝\033[0m\n";
+    std::cout << "\033[1;37m╔══════════════════════════════════════════╗\033[0m\n";
+    std::cout << "\033[1;37m║          🌊  WA-TOR  (OpenMP)            ║\033[0m\n";
+    std::cout << "\033[1;37m╚══════════════════════════════════════════╝\033[0m\n";
     std::cout << "  Paso: \033[1;33m" << std::setw(4) << t << "\033[0m"
               << "   🐟 Peces: \033[96m" << std::setw(5) << peces << "\033[0m"
-              << "   🦈 Tiburones: \033[91m" << std::setw(4) << tiburones << "\033[0m\n\n";
+              << "   🦈 Tiburones: \033[91m" << std::setw(4) << tiburones << "\033[0m"
+              << "   ⚙️  Hilos: \033[93m" << n_hilos << "\033[0m\n\n";
 
     int maxR = std::min(g.N, 30);
     int maxC = std::min(g.M, 60);
-
     for (int r = 0; r < maxR; r++) {
         std::cout << "  ";
         for (int c = 0; c < maxC; c++) {
-            switch (g.tipo[r][c]) {
+            switch (g.tipo[g.idx(r,c)]) {
                 case PEZ:     std::cout << "\033[96m●\033[0m"; break;
                 case TIBURON: std::cout << "\033[91m▲\033[0m"; break;
                 default:      std::cout << "\033[90m·\033[0m"; break;
@@ -298,7 +369,6 @@ void visualizar(const Grilla& g, int t, int peces, int tiburones,
                   << " de " << g.N << "x" << g.M << "]\033[0m\n";
 
     std::cout << "\n  \033[96m●\033[0m Peces   \033[91m▲\033[0m Tiburones   \033[90m·\033[0m Vacío\n";
-
     if ((int)hp.size() >= 5) grafico_ascii(hp, hs);
 }
 
@@ -332,12 +402,25 @@ int main() {
         std::cout << "  shark_breed                   [" << cfg.shark_breed << "]: "; std::cin >> cfg.shark_breed;
         std::cout << "  starve_time (energía inicial) [" << cfg.starve_time << "]: "; std::cin >> cfg.starve_time;
         std::cout << "  Pasos de tiempo T             [" << cfg.T           << "]: "; std::cin >> cfg.T;
+        std::cout << "  Núm. hilos OpenMP (0=auto)    [" << cfg.n_hilos     << "]: "; std::cin >> cfg.n_hilos;
         std::cout << "  Visualizar en terminal (1/0)  [" << cfg.visualizar  << "]: "; std::cin >> cfg.visualizar;
         if (cfg.visualizar) {
             std::cout << "  Delay entre frames (ms)       [" << cfg.delay_ms << "]: "; std::cin >> cfg.delay_ms;
         }
         std::cout << "  Guardar CSV (1/0)             [" << cfg.guardar_csv << "]: "; std::cin >> cfg.guardar_csv;
     }
+
+    // Configurar número de hilos
+    if (cfg.n_hilos > 0) omp_set_num_threads(cfg.n_hilos);
+    int n_hilos_real = 0;
+    #pragma omp parallel
+    {
+        #pragma omp single
+        n_hilos_real = omp_get_num_threads();
+    }
+
+    // Inicializar RNG de cada hilo
+    inicializar_rngs();
 
     int total = cfg.N * cfg.M;
     cfg.n_peces     = std::min(cfg.n_peces,     total);
@@ -346,16 +429,20 @@ int main() {
     Grilla g(cfg.N, cfg.M);
     inicializar(g, cfg);
 
+    std::cout << "\n  Hilos OpenMP activos: \033[93m" << n_hilos_real << "\033[0m\n";
+
     std::vector<int> hist_peces, hist_tiburones;
     hist_peces.reserve(cfg.T);
     hist_tiburones.reserve(cfg.T);
 
     if (!cfg.visualizar)
-        std::cout << "\n  Iniciando simulación (" << cfg.T << " pasos)...\n\n";
+        std::cout << "  Iniciando simulación (" << cfg.T << " pasos)...\n\n";
     else {
-        std::cout << "\n  Iniciando simulación...\n";
+        std::cout << "  Iniciando simulación...\n";
         std::this_thread::sleep_for(std::chrono::milliseconds(800));
     }
+
+    auto t_inicio = std::chrono::steady_clock::now();
 
     for (int t = 1; t <= cfg.T; t++) {
         paso(g, cfg);
@@ -365,7 +452,7 @@ int main() {
         hist_tiburones.push_back(nt);
 
         if (cfg.visualizar) {
-            visualizar(g, t, np, nt, hist_peces, hist_tiburones);
+            visualizar(g, t, np, nt, hist_peces, hist_tiburones, n_hilos_real);
             std::this_thread::sleep_for(std::chrono::milliseconds(cfg.delay_ms));
         } else if (t % 50 == 0 || t == 1) {
             std::cout << "  t=" << std::setw(5) << t
@@ -379,6 +466,9 @@ int main() {
         }
     }
 
+    auto t_fin = std::chrono::steady_clock::now();
+    double seg = std::chrono::duration<double>(t_fin - t_inicio).count();
+
     if (!cfg.visualizar) {
         std::cout << "\n";
         grafico_ascii(hist_peces, hist_tiburones);
@@ -388,6 +478,10 @@ int main() {
     std::cout << "\n\033[1;37m  ─── Resumen Final ───\033[0m\n";
     std::cout << "  Peces finales:     \033[96m" << fp << "\033[0m\n";
     std::cout << "  Tiburones finales: \033[91m" << ft << "\033[0m\n";
+    std::cout << "  Tiempo total:      \033[93m" << std::fixed << std::setprecision(3)
+              << seg << "s\033[0m  ("
+              << std::setprecision(1) << (hist_peces.size() / seg)
+              << " pasos/s con " << n_hilos_real << " hilos)\n";
 
     if (cfg.guardar_csv)
         guardar_csv(hist_peces, hist_tiburones);
