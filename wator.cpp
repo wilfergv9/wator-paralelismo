@@ -374,11 +374,17 @@ void visualizar(const Grilla& g, int t, int peces, int tiburones,
 
 // ─── Guardar CSV ──────────────────────────────────────────────────────────────
 void guardar_csv(const std::vector<int>& hp, const std::vector<int>& ht,
+                 const std::vector<double>& hms,
+                 int n_hilos, int N, int M,
                  const std::string& nombre = "wator_poblacion.csv") {
     std::ofstream f(nombre);
-    f << "t,peces,tiburones\n";
+    // Metadatos como comentarios legibles por pandas (se filtran con comment='#')
+    f << "# n_hilos=" << n_hilos << "\n";
+    f << "# grilla=" << N << "x" << M << "\n";
+    f << "t,peces,tiburones,tiempo_ms\n";
     for (int i = 0; i < (int)hp.size(); i++)
-        f << (i+1) << "," << hp[i] << "," << ht[i] << "\n";
+        f << (i+1) << "," << hp[i] << "," << ht[i] << ","
+          << std::fixed << std::setprecision(4) << hms[i] << "\n";
     std::cout << "\n  ✅ CSV guardado en: " << nombre << "\n";
 }
 
@@ -432,8 +438,10 @@ int main() {
     std::cout << "\n  Hilos OpenMP activos: \033[93m" << n_hilos_real << "\033[0m\n";
 
     std::vector<int> hist_peces, hist_tiburones;
+    std::vector<double> hist_ms;   // duración de cada paso en ms
     hist_peces.reserve(cfg.T);
     hist_tiburones.reserve(cfg.T);
+    hist_ms.reserve(cfg.T);
 
     if (!cfg.visualizar)
         std::cout << "  Iniciando simulación (" << cfg.T << " pasos)...\n\n";
@@ -445,11 +453,15 @@ int main() {
     auto t_inicio = std::chrono::steady_clock::now();
 
     for (int t = 1; t <= cfg.T; t++) {
+        auto tp0 = std::chrono::steady_clock::now();
         paso(g, cfg);
+        auto tp1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
         auto [np, nt] = contar(g);
         hist_peces.push_back(np);
         hist_tiburones.push_back(nt);
+        hist_ms.push_back(ms);
 
         if (cfg.visualizar) {
             visualizar(g, t, np, nt, hist_peces, hist_tiburones, n_hilos_real);
@@ -484,7 +496,8 @@ int main() {
               << " pasos/s con " << n_hilos_real << " hilos)\n";
 
     if (cfg.guardar_csv)
-        guardar_csv(hist_peces, hist_tiburones);
+        guardar_csv(hist_peces, hist_tiburones, hist_ms,
+                    n_hilos_real, cfg.N, cfg.M);
 
     std::cout << "\n  Presiona Enter para salir...\n";
     std::cin.ignore();
